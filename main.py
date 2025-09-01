@@ -5,15 +5,14 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-import mcp.client.auth.errors
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from mcp.client.auth import OAuthClientProvider
+from mcp.client.auth import OAuthClientProvider, TokenStorage
+from mcp.client.auth.errors import AuthorizationRequiredError
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
 from mcp.shared.context import RequestContext
-from mcp.storage.token import TokenStorage
 from pydantic import AnyUrl, BaseModel, Field
 from pydantic_settings import BaseSettings
 
@@ -193,7 +192,10 @@ async def oauth_callback(code: str, state: str):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(chat_request: ChatRequest):
     if not g_mcp_servers:
-       return await get_llm_response(chat_request, tools=[])
+       llm_response_data = await get_llm_response(chat_request, tools=[])
+       llm_message = llm_response_data.get("choices", [{}])[0].get("message", {})
+       return ChatResponse(type="message", message=ChatMessage(role="assistant", content=llm_message.get("content", "")))
+
 
     all_tools = []
     tool_to_server_map = {}
@@ -228,7 +230,7 @@ async def chat(chat_request: ChatRequest):
             result = await server_info.session.call_tool(original_tool_name, arguments=tool_args)
             content = json.dumps(result.structuredContent) if result.structuredContent else (result.content[0].text if result.content and hasattr(result.content[0], 'text') else "Tool executed successfully with no textual output.")
             chat_request.messages.append(ChatMessage(role="tool", tool_call_id=tool_call_id, content=content))
-        except mcp.client.auth.errors.AuthorizationRequiredError as e:
+        except AuthorizationRequiredError as e:
             return ChatResponse(type="oauth_redirect", redirect_url=str(e.auth_url))
         except Exception as e:
             print(f"Error calling tool {tool_name}: {e}")
@@ -253,4 +255,5 @@ async def get_llm_response(chat_request: ChatRequest, tools: List[Dict]) -> Dict
             raise HTTPException(status_code=e.response.status_code, detail=f"Error from OpenRouter: {e.response.text}")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"An unexpected error occurred while contacting OpenRouter: {e}")
+
 
