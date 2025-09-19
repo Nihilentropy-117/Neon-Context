@@ -1,53 +1,45 @@
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Literal, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from typing import Any, Dict, List, Literal, Optional
 
-import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
-from mcp.client.auth import OAuthClientProvider, TokenStorage
-from mcp.client.auth.errors import AuthorizationRequiredError
+from mcp.client.auth import (
+    AuthorizationRequiredError,
+    OAuthClientProvider,
+    TokenStorage,
+)
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
-from mcp.shared.context import RequestContext
+from mcp.shared.auth import (
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthToken,
+)
 from pydantic import AnyUrl, BaseModel, Field
 from pydantic_settings import BaseSettings
 
+import httpx
 
 # --- Configuration ---
+SERVERS_DATA_DIR = "data"
+SERVERS_FILE = os.path.join(SERVERS_DATA_DIR, "servers.json")
+
 class Settings(BaseSettings):
     app_base_url: str = "http://localhost:80"
-
     class Config:
         env_file = ".env"
-        # In Docker, we read from the environment, which is populated by docker-compose
         env_file_encoding = 'utf-8'
 
 settings = Settings()
 
 
-# --- In-Memory Storage (for demonstration purposes) ---
-class InMemoryTokenStorage(TokenStorage):
-    def __init__(self):
-        self._tokens: Dict[str, OAuthToken] = {}
-        self._client_info: Dict[str, OAuthClientInformationFull] = {}
-
-    async def get_tokens(self, server_name: str) -> OAuthToken | None:
-        return self._tokens.get(server_name)
-
-    async def set_tokens(self, server_name: str, tokens: OAuthToken) -> None:
-        self._tokens[server_name] = tokens
-
-    async def get_client_info(self, server_name: str) -> OAuthClientInformationFull | None:
-        return self._client_info.get(server_name)
-
-    async def set_client_info(self, server_name: str, client_info: OAuthClientInformationFull) -> None:
-        self._client_info[server_name] = client_info
-
-g_token_storage = InMemoryTokenStorage()
+# --- Pydantic Models ---
+class MCPServerConfig(BaseModel):
+    name: str = Field(..., description="A unique name for this MCP server connection.")
+    url: str = Field(..., description="The base URL of the MCP server.")
 
 class MCPServerInfo(BaseModel):
     name: str
@@ -56,49 +48,8 @@ class MCPServerInfo(BaseModel):
     read_stream: Any
     write_stream: Any
     auth_provider: Optional[OAuthClientProvider] = None
-
     class Config:
         arbitrary_types_allowed = True
-
-g_mcp_servers: Dict[str, MCPServerInfo] = {}
-g_oauth_flows: Dict[str, asyncio.Future] = {}
-
-
-# --- OAuth Handlers for the Backend ---
-async def handle_redirect(auth_url: str) -> None:
-    pass
-
-async def handle_callback(state: str) -> tuple[str, str | None]:
-    future = asyncio.get_event_loop().create_future()
-    g_oauth_flows[state] = future
-    return await future
-
-
-# --- FastAPI Application Setup ---
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("Starting MCP Chat Backend...")
-    yield
-    print("Shutting down... disconnecting from MCP servers.")
-    for server_name, server_info in list(g_mcp_servers.items()):
-        try:
-            await server_info.session.shutdown()
-        except Exception as e:
-            print(f"Error shutting down server {server_name}: {e}")
-    g_mcp_servers.clear()
-
-
-app = FastAPI(
-    title="MCP Chat Backend",
-    description="A backend to proxy chat requests to OpenRouter and provide MCP tools.",
-    lifespan=lifespan
-)
-
-
-# --- Pydantic Models for API Endpoints ---
-class MCPServerConfig(BaseModel):
-    name: str = Field(..., description="A unique name for this MCP server connection.")
-    url: str = Field(..., description="The base URL of the MCP server (e.g., http://localhost:3001).")
 
 class MCPServerDetails(BaseModel):
     name: str
@@ -122,11 +73,45 @@ class ChatResponse(BaseModel):
     error: Optional[str] = None
 
 
-# --- API Endpoints ---
-@app.post("/mcp_servers", status_code=201)
-async def add_mcp_server(config: MCPServerConfig):
+# --- In-Memory State and Storage ---
+class InMemoryTokenStorage(TokenStorage):
+    def __init__(self):
+        self._tokens: Dict[str, OAuthToken] = {}
+        self._client_info: Dict[str, OAuthClientInformationFull] = {}
+    async def get_tokens(self, server_name: str) -> OAuthToken | None: return self._tokens.get(server_name)
+    async def set_tokens(self, server_name: str, tokens: OAuthToken) -> None: self._tokens[server_name] = tokens
+    async def get_client_info(self, server_name: str) -> OAuthClientInformationFull | None: return self._client_info.get(server_name)
+    async def set_client_info(self, server_name: str, client_info: OAuthClientInformationFull) -> None: self._client_info[server_name] = client_info
+
+g_token_storage = InMemoryTokenStorage()
+g_mcp_servers: Dict[str, MCPServerInfo] = {}
+g_oauth_flows: Dict[str, asyncio.Future] = {}
+
+
+# --- Persistence Functions ---
+def save_mcp_servers_to_disk():
+    os.makedirs(SERVERS_DATA_DIR, exist_ok=True)
+    server_configs = [{"name": s.name, "url": s.url} for s in g_mcp_servers.values()]
+    with open(SERVERS_FILE, "w") as f:
+        json.dump(server_configs, f, indent=2)
+
+async def load_mcp_servers_from_disk():
+    if not os.path.exists(SERVERS_FILE):
+        return
+    try:
+        with open(SERVERS_FILE, "r") as f:
+            server_configs = json.load(f)
+        print(f"Found {len(server_configs)} saved servers. Reconnecting...")
+        for config in server_configs:
+            await connect_to_mcp_server(MCPServerConfig(**config))
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"Could not load server configurations: {e}")
+
+
+# --- Core Logic ---
+async def connect_to_mcp_server(config: MCPServerConfig) -> str:
     if config.name in g_mcp_servers:
-        raise HTTPException(status_code=409, detail=f"Server with name '{config.name}' already exists.")
+        return f"Server '{config.name}' is already connected."
 
     try:
         oauth_provider = OAuthClientProvider(
@@ -140,7 +125,7 @@ async def add_mcp_server(config: MCPServerConfig):
             ),
             storage=g_token_storage,
             storage_key=config.name,
-            redirect_handler=handle_redirect,
+            redirect_handler=lambda auth_url: None,
             callback_handler=lambda: handle_callback(oauth_provider.state),
         )
 
@@ -159,11 +144,45 @@ async def add_mcp_server(config: MCPServerConfig):
             write_stream=write,
             auth_provider=oauth_provider,
         )
-        return {"status": "success", "message": f"Successfully connected to MCP server '{config.name}'."}
+        return f"Successfully connected to MCP server '{config.name}'."
     except Exception as e:
         if 'client_context' in locals():
             await client_context.__aexit__(type(e), e, e.__traceback__)
-        raise HTTPException(status_code=502, detail=f"Failed to connect to MCP server at {config.url}: {e}")
+        raise ConnectionError(f"Failed to connect to MCP server at {config.url}: {e}")
+
+async def handle_callback(state: str) -> tuple[str, str | None]:
+    future = asyncio.get_event_loop().create_future()
+    g_oauth_flows[state] = future
+    return await future
+
+
+# --- FastAPI Application ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("Starting MCP Chat Backend...")
+    await load_mcp_servers_from_disk()
+    yield
+    print("Shutting down... disconnecting from MCP servers.")
+    for server_name, server_info in list(g_mcp_servers.items()):
+        try:
+            await server_info.session.shutdown()
+        except Exception as e:
+            print(f"Error shutting down server {server_name}: {e}")
+    g_mcp_servers.clear()
+
+app = FastAPI(title="MCP Chat Backend", lifespan=lifespan)
+
+@app.post("/mcp_servers", status_code=201)
+async def add_mcp_server(config: MCPServerConfig):
+    try:
+        message = await connect_to_mcp_server(config)
+        if "already connected" in message:
+             raise HTTPException(status_code=409, detail=message)
+        save_mcp_servers_to_disk()
+        return {"status": "success", "message": message}
+    except ConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
 
 @app.delete("/mcp_servers/{server_name}")
 async def remove_mcp_server(server_name: str):
@@ -174,6 +193,7 @@ async def remove_mcp_server(server_name: str):
         await server_info.session.shutdown()
     except Exception as e:
         print(f"Error during shutdown of {server_name}: {e}")
+    save_mcp_servers_to_disk()
     return {"status": "success", "message": f"Disconnected from server '{server_name}'."}
 
 @app.get("/mcp_servers", response_model=List[MCPServerDetails])
@@ -191,14 +211,7 @@ async def oauth_callback(code: str, state: str):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(chat_request: ChatRequest):
-    if not g_mcp_servers:
-       llm_response_data = await get_llm_response(chat_request, tools=[])
-       llm_message = llm_response_data.get("choices", [{}])[0].get("message", {})
-       return ChatResponse(type="message", message=ChatMessage(role="assistant", content=llm_message.get("content", "")))
-
-
-    all_tools = []
-    tool_to_server_map = {}
+    all_tools, tool_to_server_map = [], {}
     for name, server_info in g_mcp_servers.items():
         try:
             tool_list = await server_info.session.list_tools()
@@ -221,14 +234,15 @@ async def chat(chat_request: ChatRequest):
     for tool_call in response_message["tool_calls"]:
         tool_name, tool_args, tool_call_id = tool_call["function"]["name"], json.loads(tool_call["function"]["arguments"]), tool_call["id"]
         if tool_name not in tool_to_server_map:
-             return ChatResponse(type="message", error=f"LLM tried to call unknown tool: {tool_name}")
+             chat_request.messages.append(ChatMessage(role="tool", tool_call_id=tool_call_id, content=f"Error: Tool '{tool_name}' not found."))
+             continue
 
         server_info = tool_to_server_map[tool_name]
         original_tool_name = tool_name.split("__", 1)[1]
 
         try:
             result = await server_info.session.call_tool(original_tool_name, arguments=tool_args)
-            content = json.dumps(result.structuredContent) if result.structuredContent else (result.content[0].text if result.content and hasattr(result.content[0], 'text') else "Tool executed successfully with no textual output.")
+            content = json.dumps(result.structuredContent) if result.structuredContent else (result.content[0].text if result.content and hasattr(result.content[0], 'text') else "Tool executed.")
             chat_request.messages.append(ChatMessage(role="tool", tool_call_id=tool_call_id, content=content))
         except AuthorizationRequiredError as e:
             return ChatResponse(type="oauth_redirect", redirect_url=str(e.auth_url))
@@ -254,6 +268,6 @@ async def get_llm_response(chat_request: ChatRequest, tools: List[Dict]) -> Dict
         except httpx.HTTPStatusError as e:
             raise HTTPException(status_code=e.response.status_code, detail=f"Error from OpenRouter: {e.response.text}")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"An unexpected error occurred while contacting OpenRouter: {e}")
+            raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 
