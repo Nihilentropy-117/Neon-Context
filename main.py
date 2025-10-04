@@ -1,273 +1,851 @@
 import asyncio
 import json
+import logging
 import os
-from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Literal, Optional
-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from mcp.client.auth import (
-    AuthorizationRequiredError,
-    OAuthClientProvider,
-    TokenStorage,
-)
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
-from mcp.shared.auth import (
-    OAuthClientInformationFull,
-    OAuthClientMetadata,
-    OAuthToken,
-)
-from pydantic import AnyUrl, BaseModel, Field
-from pydantic_settings import BaseSettings
+import re
+import threading
+import time
+import webbrowser
+from contextlib import AsyncExitStack, suppress
+from dataclasses import dataclass
+from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import httpx
+from dotenv import load_dotenv
+from mcp import types
+from mcp.client.auth import OAuthClientProvider, TokenStorage
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
 
-# --- Configuration ---
-SERVERS_DATA_DIR = "data"
-SERVERS_FILE = os.path.join(SERVERS_DATA_DIR, "servers.json")
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-class Settings(BaseSettings):
-    app_base_url: str = "http://localhost:80"
-    class Config:
-        env_file = ".env"
-        env_file_encoding = 'utf-8'
-
-settings = Settings()
+CONFIG_PATH = Path(__file__).resolve().parent / "servers_config.json"
+TOKENS_DIR = Path(__file__).resolve().parent / "tokens"
+CALLBACK_HOST = "127.0.0.1"
+CALLBACK_PORT = 3030
 
 
-# --- Pydantic Models ---
-class MCPServerConfig(BaseModel):
-    name: str = Field(..., description="A unique name for this MCP server connection.")
-    url: str = Field(..., description="The base URL of the MCP server.")
+class Configuration:
+    """Manages environment variables for the MCP client."""
 
-class MCPServerInfo(BaseModel):
-    name: str
+    def __init__(self) -> None:
+        self.load_env()
+        self.api_key = os.getenv("LLM_API_KEY")
+
+    @staticmethod
+    def load_env() -> None:
+        load_dotenv()
+
+    @property
+    def llm_api_key(self) -> str:
+        if not self.api_key:
+            return "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"
+            # raise ValueError("LLM_API_KEY not found in environment variables")
+        return self.api_key
+
+
+@dataclass
+class ServerRecord:
+    server_id: str
     url: str
-    session: ClientSession
-    read_stream: Any
-    write_stream: Any
-    auth_provider: Optional[OAuthClientProvider] = None
-    class Config:
-        arbitrary_types_allowed = True
+    transport: str = "streamable-http"
+    name: str | None = None
 
-class MCPServerDetails(BaseModel):
-    name: str
-    url: str
-
-class ChatMessage(BaseModel):
-    role: Literal["user", "assistant", "tool"]
-    content: str
-    tool_calls: Optional[List[Dict]] = None
-    tool_call_id: Optional[str] = None
-
-class ChatRequest(BaseModel):
-    messages: List[ChatMessage]
-    openrouter_api_key: str = Field(..., description="Your OpenRouter API key.")
-    model: str = Field("anthropic/claude-3.5-sonnet", description="The model to use on OpenRouter.")
-
-class ChatResponse(BaseModel):
-    type: Literal["message", "oauth_redirect"]
-    message: Optional[ChatMessage] = None
-    redirect_url: Optional[str] = None
-    error: Optional[str] = None
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "server_id": self.server_id,
+            "url": self.url,
+            "transport": self.transport,
+            "name": self.name,
+        }
 
 
-# --- In-Memory State and Storage ---
-class InMemoryTokenStorage(TokenStorage):
-    def __init__(self):
-        self._tokens: Dict[str, OAuthToken] = {}
-        self._client_info: Dict[str, OAuthClientInformationFull] = {}
-    async def get_tokens(self, server_name: str) -> OAuthToken | None: return self._tokens.get(server_name)
-    async def set_tokens(self, server_name: str, tokens: OAuthToken) -> None: self._tokens[server_name] = tokens
-    async def get_client_info(self, server_name: str) -> OAuthClientInformationFull | None: return self._client_info.get(server_name)
-    async def set_client_info(self, server_name: str, client_info: OAuthClientInformationFull) -> None: self._client_info[server_name] = client_info
+def derive_server_id(url: str, existing_ids: set[str]) -> str:
+    parsed = urlparse(url)
+    base = parsed.netloc or parsed.path or "server"
+    path_part = parsed.path.strip("/").replace("/", "_")
+    if path_part:
+        base = f"{base}_{path_part}"
+    base = base.lower()
+    cleaned = re.sub(r"[^a-z0-9_-]+", "-", base).strip("-") or "server"
 
-g_token_storage = InMemoryTokenStorage()
-g_mcp_servers: Dict[str, MCPServerInfo] = {}
-g_oauth_flows: Dict[str, asyncio.Future] = {}
+    candidate = cleaned
+    suffix = 2
+    while candidate in existing_ids:
+        candidate = f"{cleaned}-{suffix}"
+        suffix += 1
 
-
-# --- Persistence Functions ---
-def save_mcp_servers_to_disk():
-    os.makedirs(SERVERS_DATA_DIR, exist_ok=True)
-    server_configs = [{"name": s.name, "url": s.url} for s in g_mcp_servers.values()]
-    with open(SERVERS_FILE, "w") as f:
-        json.dump(server_configs, f, indent=2)
-
-async def load_mcp_servers_from_disk():
-    if not os.path.exists(SERVERS_FILE):
-        return
-    try:
-        with open(SERVERS_FILE, "r") as f:
-            server_configs = json.load(f)
-        print(f"Found {len(server_configs)} saved servers. Reconnecting...")
-        for config in server_configs:
-            await connect_to_mcp_server(MCPServerConfig(**config))
-    except (json.JSONDecodeError, FileNotFoundError) as e:
-        print(f"Could not load server configurations: {e}")
+    return candidate
 
 
-# --- Core Logic ---
-async def connect_to_mcp_server(config: MCPServerConfig) -> str:
-    if config.name in g_mcp_servers:
-        return f"Server '{config.name}' is already connected."
+class PersistentServerStore:
+    """Persists MCP server configuration to disk."""
 
-    try:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._data = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"servers": []}
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except json.JSONDecodeError as exc:
+            logging.warning("Failed to parse %s: %s", self.path, exc)
+            return {"servers": []}
+
+        servers = data.get("servers")
+        if isinstance(servers, list):
+            return {"servers": servers}
+        return {"servers": []}
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w", encoding="utf-8") as handle:
+            json.dump(self._data, handle, indent=2)
+
+    def list_records(self) -> list[ServerRecord]:
+        return [ServerRecord(**entry) for entry in self._data["servers"]]
+
+    def upsert(self, record: ServerRecord) -> None:
+        for index, entry in enumerate(self._data["servers"]):
+            if entry.get("server_id") == record.server_id:
+                self._data["servers"][index] = record.as_dict()
+                self.save()
+                return
+        self._data["servers"].append(record.as_dict())
+        self.save()
+
+    def remove(self, server_id: str) -> None:
+        before = len(self._data["servers"])
+        self._data["servers"] = [entry for entry in self._data["servers"] if entry.get("server_id") != server_id]
+        if len(self._data["servers"]) != before:
+            self.save()
+
+
+class FileTokenStorage(TokenStorage):
+    """Stores OAuth tokens and client info for a single server."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = asyncio.Lock()
+
+    async def _read(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {}
+
+        def _load() -> dict[str, Any]:
+            with self.path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+
+        try:
+            return await asyncio.to_thread(_load)
+        except FileNotFoundError:
+            return {}
+        except json.JSONDecodeError as exc:
+            logging.warning("Failed to parse token file %s: %s", self.path, exc)
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+            return {}
+
+    async def _write(self, data: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _dump() -> None:
+            tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+            tmp_path.replace(self.path)
+
+        await asyncio.to_thread(_dump)
+
+    async def get_tokens(self) -> OAuthToken | None:
+        async with self._lock:
+            data = await self._read()
+            token_data = data.get("tokens")
+            if token_data:
+                return OAuthToken.model_validate(token_data)
+            return None
+
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        async with self._lock:
+            data = await self._read()
+            data["tokens"] = tokens.model_dump(mode="json")
+            await self._write(data)
+
+    async def get_client_info(self) -> OAuthClientInformationFull | None:
+        async with self._lock:
+            data = await self._read()
+            client_info = data.get("client_info")
+            if client_info:
+                return OAuthClientInformationFull.model_validate(client_info)
+            return None
+
+    async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
+        async with self._lock:
+            data = await self._read()
+            data["client_info"] = client_info.model_dump(mode="json")
+            await self._write(data)
+
+    async def clear(self) -> None:
+        async with self._lock:
+            if self.path.exists():
+                self.path.unlink()
+
+
+class CallbackHandler(BaseHTTPRequestHandler):
+    """Handles OAuth callbacks and stores results in shared state."""
+
+    def __init__(self, request, client_address, server, callback_data):
+        self.callback_data = callback_data
+        super().__init__(request, client_address, server)
+
+    def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        parsed = urlparse(self.path)
+        query_params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+
+        if "code" in query_params:
+            self.callback_data["authorization_code"] = query_params["code"]
+            self.callback_data["state"] = query_params.get("state")
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"""
+                <html>
+                <body>
+                    <h1>Authorization Successful!</h1>
+                    <p>You can close this window and return to the terminal.</p>
+                    <script>setTimeout(() => window.close(), 2000);</script>
+                </body>
+                </html>
+                """
+            )
+        elif "error" in query_params:
+            self.callback_data["error"] = query_params["error"]
+            self.send_response(400)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""
+                <html>
+                <body>
+                    <h1>Authorization Failed</h1>
+                    <p>Error: {query_params['error']}</p>
+                    <p>You can close this window and return to the terminal.</p>
+                </body>
+                </html>
+                """.encode()
+            )
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003 - match base signature
+        pass
+
+
+class CallbackServer:
+    """Runs a temporary HTTP server to receive OAuth callbacks."""
+
+    def __init__(self, host: str = CALLBACK_HOST, port: int = CALLBACK_PORT) -> None:
+        self.host = host
+        self.port = port
+        self.server: HTTPServer | None = None
+        self.thread: threading.Thread | None = None
+        self.callback_data: dict[str, Any] = {"authorization_code": None, "state": None, "error": None}
+
+    def _create_handler(self):
+        callback_data = self.callback_data
+
+        class DataCallbackHandler(CallbackHandler):
+            def __init__(self, request, client_address, server):
+                super().__init__(request, client_address, server, callback_data)
+
+        return DataCallbackHandler
+
+    def start(self) -> None:
+        handler_class = self._create_handler()
+        self.server = HTTPServer((self.host, self.port), handler_class)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        logging.info("Started OAuth callback server on http://%s:%s", self.host, self.port)
+
+    def stop(self) -> None:
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+            self.server = None
+        if self.thread:
+            self.thread.join(timeout=1)
+            self.thread = None
+
+    def wait_for_callback(self, timeout: float = 300.0) -> str:
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self.callback_data.get("authorization_code"):
+                return self.callback_data["authorization_code"]
+            if self.callback_data.get("error"):
+                raise RuntimeError(f"OAuth error: {self.callback_data['error']}")
+            time.sleep(0.1)
+        raise TimeoutError("Timeout waiting for OAuth callback")
+
+    def get_state(self) -> str | None:
+        return self.callback_data.get("state")
+
+
+class Tool:
+    def __init__(self, name: str, description: str, input_schema: dict[str, Any], provider: str, title: str | None = None) -> None:
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self.provider = provider
+        self.title = title
+
+    def format_for_llm(self) -> str:
+        args_desc = []
+        properties = self.input_schema.get("properties") if isinstance(self.input_schema, dict) else None
+        required = set(self.input_schema.get("required", [])) if isinstance(self.input_schema, dict) else set()
+        if isinstance(properties, dict):
+            for param_name, param_info in properties.items():
+                segment = f"- {param_name}: {param_info.get('description', 'No description')}"
+                if param_name in required:
+                    segment += " (required)"
+                args_desc.append(segment)
+
+        args_text = "\n".join(args_desc) if args_desc else "- No arguments"
+        title_line = f"User-readable title: {self.title}\n" if self.title else ""
+
+        return (
+            f"Tool: {self.name}\n"
+            f"Provided by: {self.provider}\n"
+            f"{title_line}Description: {self.description}\n"
+            f"Arguments:\n{args_text}\n"
+        )
+
+
+class HostedServer:
+    """Manages a hosted MCP server connection over streamable HTTP with optional OAuth."""
+
+    def __init__(self, record: ServerRecord, token_storage: FileTokenStorage) -> None:
+        self.record = record
+        self.token_storage = token_storage
+        self.exit_stack = AsyncExitStack()
+        self.session: ClientSession | None = None
+        self.initialize_result: types.InitializeResult | None = None
+        self.session_id: str | None = None
+        self._get_session_id = None
+
+    @property
+    def display_name(self) -> str:
+        if self.initialize_result and self.initialize_result.serverInfo:
+            info = self.initialize_result.serverInfo
+            if info.title:
+                return info.title
+            if info.name:
+                return info.name
+        if self.record.name:
+            return self.record.name
+        parsed = urlparse(self.record.url)
+        return parsed.netloc or self.record.server_id
+
+    def _base_url(self) -> str:
+        url = self.record.url.rstrip("/")
+        if url.endswith("/mcp") or url.endswith("/sse"):
+            return url.rsplit("/", 1)[0]
+        return url
+
+    async def initialize(self) -> None:
+        existing_tokens = await self.token_storage.get_tokens()
+        if existing_tokens:
+            await self._connect_with_oauth()
+        else:
+            try:
+                await self._connect_with_oauth()
+            except Exception as oauth_error:
+                logging.info(
+                    "OAuth flow failed for %s, attempting unauthenticated connection: %s",
+                    self.record.url,
+                    oauth_error,
+                )
+                await self.cleanup()
+                await self._connect(auth=None)
+        self.record.name = self.display_name
+
+    async def _connect(self, auth: OAuthClientProvider | None) -> None:
+        self.exit_stack = AsyncExitStack()
+        try:
+            transport = await self.exit_stack.enter_async_context(
+                streamablehttp_client(
+                    url=self.record.url,
+                    auth=auth,
+                    timeout=timedelta(seconds=60),
+                )
+            )
+            read, write, get_session_id = transport
+            session = await self.exit_stack.enter_async_context(ClientSession(read, write))
+            self.initialize_result = await session.initialize()
+            self.session = session
+            self._get_session_id = get_session_id
+            if get_session_id:
+                try:
+                    self.session_id = get_session_id()
+                except Exception:
+                    self.session_id = None
+        except asyncio.CancelledError as cancel:
+            task = asyncio.current_task()
+            if task and hasattr(task, "uncancel"):
+                task.uncancel()
+            with suppress(Exception):
+                await self.exit_stack.aclose()
+            raise RuntimeError("Connection attempt cancelled") from cancel
+        except Exception:
+            with suppress(Exception):
+                await self.exit_stack.aclose()
+            raise
+
+    async def _connect_with_oauth(self) -> None:
+        callback_server = CallbackServer(host=CALLBACK_HOST, port=CALLBACK_PORT)
+        callback_server.start()
+
+        async def callback_handler() -> tuple[str, str | None]:
+            logging.info("Waiting for OAuth callback...")
+            try:
+                auth_code = await asyncio.to_thread(callback_server.wait_for_callback)
+                return auth_code, callback_server.get_state()
+            finally:
+                callback_server.stop()
+
+        async def redirect_handler(authorization_url: str) -> None:
+            logging.info("Opening browser for authorization: %s", authorization_url)
+            await asyncio.to_thread(webbrowser.open, authorization_url)
+
+        metadata = OAuthClientMetadata.model_validate(
+            {
+                "client_name": "Simple Chatbot",
+                "redirect_uris": [f"http://{CALLBACK_HOST}:{CALLBACK_PORT}/callback"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "client_secret_post",
+            }
+        )
+
         oauth_provider = OAuthClientProvider(
-            server_url=config.url,
-            client_metadata=OAuthClientMetadata(
-                client_name="MCP Chat Backend Client",
-                redirect_uris=[AnyUrl(f"{settings.app_base_url}/oauth/callback")],
-                grant_types=["authorization_code", "refresh_token"],
-                response_types=["code"],
-                scope="user",
-            ),
-            storage=g_token_storage,
-            storage_key=config.name,
-            redirect_handler=lambda auth_url: None,
-            callback_handler=lambda: handle_callback(oauth_provider.state),
+            server_url=self._base_url(),
+            client_metadata=metadata,
+            storage=self.token_storage,
+            redirect_handler=redirect_handler,
+            callback_handler=callback_handler,
         )
 
-        mcp_endpoint = f"{config.url.rstrip('/')}/mcp"
-        client_context = streamablehttp_client(mcp_endpoint, auth=oauth_provider)
-        read, write, _ = await client_context.__aenter__()
+        try:
+            await self._connect(auth=oauth_provider)
+        finally:
+            callback_server.stop()
 
-        session = ClientSession(read, write)
-        await session.initialize()
+    async def list_tools(self) -> list[Tool]:
+        if not self.session:
+            raise RuntimeError(f"Server {self.record.server_id} not initialized")
+        result = await self.session.list_tools()
+        tools = []
+        for tool in result.tools:
+            if hasattr(tool.inputSchema, "model_dump"):
+                schema = tool.inputSchema.model_dump()
+            elif isinstance(tool.inputSchema, dict):
+                schema = tool.inputSchema
+            elif tool.inputSchema is None:
+                schema = {}
+            else:
+                schema = json.loads(tool.inputSchema)
+            tools.append(
+                Tool(
+                    name=tool.name,
+                    description=tool.description or "No description provided",
+                    input_schema=schema,
+                    provider=self.display_name,
+                    title=tool.title,
+                )
+            )
+        return tools
 
-        g_mcp_servers[config.name] = MCPServerInfo(
-            name=config.name,
-            url=config.url,
-            session=session,
-            read_stream=read,
-            write_stream=write,
-            auth_provider=oauth_provider,
+    async def execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+        if not self.session:
+            raise RuntimeError(f"Server {self.record.server_id} not initialized")
+        return await self.session.call_tool(tool_name, arguments)
+
+    async def cleanup(self) -> None:
+        try:
+            await self.exit_stack.aclose()
+        finally:
+            self.session = None
+            self.initialize_result = None
+            self._get_session_id = None
+            self.session_id = None
+
+
+class ServerManager:
+    """Coordinates hosted MCP servers, tokens, and persistence."""
+
+    def __init__(self, store: PersistentServerStore, tokens_dir: Path) -> None:
+        self.store = store
+        self.tokens_dir = tokens_dir
+        self.tokens_dir.mkdir(parents=True, exist_ok=True)
+        self.active_servers: dict[str, HostedServer] = {}
+
+    def _token_path(self, server_id: str) -> Path:
+        return self.tokens_dir / f"{server_id}.json"
+
+    def records(self) -> list[ServerRecord]:
+        return self.store.list_records()
+
+    def connected_servers(self) -> list[HostedServer]:
+        return list(self.active_servers.values())
+
+    def _normalize_url(self, url: str) -> str:
+        cleaned = url.strip()
+        cleaned = cleaned.rstrip(",;")
+        if not cleaned:
+            raise ValueError("URL cannot be empty")
+        parsed = urlparse(cleaned)
+        if not parsed.scheme:
+            cleaned = "https://" + cleaned
+        return cleaned
+
+    async def initialize_all(self) -> None:
+        records = self.records()
+        for record in records:
+            if record.server_id in self.active_servers:
+                continue
+            try:
+                await self._connect_record(record)
+            except Exception as exc:
+                logging.error("Failed to initialize %s: %s", record.url, exc)
+
+    async def _connect_record(self, record: ServerRecord) -> HostedServer:
+        storage = FileTokenStorage(self._token_path(record.server_id))
+        server = HostedServer(record, storage)
+        await server.initialize()
+        record.name = server.display_name
+        self.store.upsert(record)
+        self.active_servers[record.server_id] = server
+        return server
+
+    async def add_server(self, url: str) -> HostedServer:
+        normalized_url = self._normalize_url(url)
+        existing_urls = {record.url for record in self.records()}
+        if normalized_url in existing_urls:
+            raise ValueError("Server already configured")
+
+        existing_ids = {record.server_id for record in self.records()}
+        server_id = derive_server_id(normalized_url, existing_ids)
+        record = ServerRecord(server_id=server_id, url=normalized_url)
+        server = await self._connect_record(record)
+        logging.info("Added server %s (%s)", server.display_name, record.url)
+        return server
+
+    async def remove_server(self, server_id: str) -> None:
+        server = self.active_servers.pop(server_id, None)
+        if server:
+            await server.cleanup()
+        self.store.remove(server_id)
+        token_path = self._token_path(server_id)
+        if token_path.exists():
+            token_path.unlink()
+        logging.info("Removed server %s", server_id)
+
+    async def refresh_tool_cache(self) -> dict[str, list[Tool]]:
+        cache: dict[str, list[Tool]] = {}
+        for server in self.connected_servers():
+            try:
+                cache[server.record.server_id] = await server.list_tools()
+            except Exception as exc:
+                logging.error("Failed to list tools for %s: %s", server.record.url, exc)
+        return cache
+
+    async def shutdown(self) -> None:
+        for server in list(self.active_servers.values()):
+            try:
+                await server.cleanup()
+            except Exception as exc:
+                logging.warning("Error while shutting down %s: %s", server.record.url, exc)
+        self.active_servers.clear()
+
+
+class LLMClient:
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+
+    def get_response(self, messages: list[dict[str, str]]) -> str:
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "HTTP-Referer": "https://github.com/yourusername/mcp-chatbot",
+            "X-Title": "MCP Chatbot",
+        }
+        payload = {
+            "messages": messages,
+            "model": "anthropic/claude-4.5-sonnet",
+            "temperature": 0.7,
+            "max_tokens": 4096,
+            "top_p": 1,
+            "stream": False,
+        }
+
+        try:
+            with httpx.Client() as client:
+                response = client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+        except httpx.RequestError as exc:
+            logging.error("Error getting LLM response: %s", exc)
+            if isinstance(exc, httpx.HTTPStatusError):
+                logging.error("Status code: %s", exc.response.status_code)
+                logging.error("Response details: %s", exc.response.text)
+            return "I encountered an error reaching the LLM. Please try again later."
+
+
+class ChatSession:
+    def __init__(self, server_manager: ServerManager, llm_client: LLMClient) -> None:
+        self.server_manager = server_manager
+        self.llm_client = llm_client
+        self.tool_cache: dict[str, list[Tool]] = {}
+        self.tool_to_server: dict[str, HostedServer] = {}
+        self.messages: list[dict[str, str]] = []
+        self.system_message: str = ""
+
+    async def refresh_tools(self) -> None:
+        self.tool_cache = await self.server_manager.refresh_tool_cache()
+        self.tool_to_server.clear()
+        tools: list[Tool] = []
+        for server_id, server_tools in self.tool_cache.items():
+            server = self.server_manager.active_servers.get(server_id)
+            if not server:
+                continue
+            for tool in server_tools:
+                logging.info("Tool schema loaded: %s -> %s", tool.name, json.dumps(tool.input_schema, indent=2))
+                if tool.name not in self.tool_to_server:
+                    self.tool_to_server[tool.name] = server
+            tools.extend(server_tools)
+        self.system_message = self._build_system_prompt(tools)
+        if self.messages and self.messages[0]["role"] == "system":
+            self.messages[0]["content"] = self.system_message
+        else:
+            self.messages.insert(0, {"role": "system", "content": self.system_message})
+
+    @staticmethod
+    def _build_system_prompt(tools: list[Tool]) -> str:
+        if tools:
+            tools_description = "\n".join(tool.format_for_llm() for tool in tools)
+        else:
+            tools_description = "No MCP tools are currently configured. Respond directly without using tools."
+
+        return (
+            "You are a helpful assistant with access to these tools:\n\n"
+            f"{tools_description}\n\n"
+            "When you need to call a tool, DO NOT COMMENT. ONLY respond with exactly this JSON structure, and NOTHING else:\n"
+            "{\n"
+            '    "tool": "tool-name",\n'
+            '    "arguments": {\n'
+            '        "argument-name": "value"\n'
+            "    }\n"
+            "}\n\n"
+            "After the tool responds, summarise the results conversationally. If no tool is required, reply directly."
         )
-        return f"Successfully connected to MCP server '{config.name}'."
-    except Exception as e:
-        if 'client_context' in locals():
-            await client_context.__aexit__(type(e), e, e.__traceback__)
-        raise ConnectionError(f"Failed to connect to MCP server at {config.url}: {e}")
 
-async def handle_callback(state: str) -> tuple[str, str | None]:
-    future = asyncio.get_event_loop().create_future()
-    g_oauth_flows[state] = future
-    return await future
+    async def open_mcp_menu(self) -> None:
+        while True:
+            print("\n--- MCP Server Manager ---")
+            records = self.server_manager.records()
+            if records:
+                for index, record in enumerate(records, start=1):
+                    status = "connected" if record.server_id in self.server_manager.active_servers else "disconnected"
+                    name = record.name or record.server_id
+                    print(f"{index}. {name} ({record.url}) - {status}")
+            else:
+                print("No servers configured.")
 
+            print("\nOptions:")
+            print("  1. Add server")
+            print("  2. Remove server")
+            print("  3. Refresh tool list")
+            print("  4. Back to chat")
 
-# --- FastAPI Application ---
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("Starting MCP Chat Backend...")
-    await load_mcp_servers_from_disk()
-    yield
-    print("Shutting down... disconnecting from MCP servers.")
-    for server_name, server_info in list(g_mcp_servers.items()):
+            choice = input("mcp> ").strip().lower()
+            if choice in {"4", "back", "b"}:
+                break
+            if choice == "1" or choice == "add":
+                url = input("Enter MCP server URL: ").strip()
+                if not url:
+                    print("No URL provided.")
+                    continue
+                try:
+                    await self.server_manager.add_server(url)
+                    await self.refresh_tools()
+                    print("Server added successfully.")
+                except BaseException as exc:
+                    if isinstance(exc, KeyboardInterrupt):
+                        raise
+                    if isinstance(exc, asyncio.CancelledError):
+                        task = asyncio.current_task()
+                        if task and hasattr(task, "uncancel"):
+                            task.uncancel()
+                    print(f"Failed to add server: {exc}")
+            elif choice == "2" or choice == "remove":
+                if not records:
+                    print("No servers to remove.")
+                    continue
+                selection = input("Enter server number to remove: ").strip()
+                if not selection:
+                    continue
+                try:
+                    index = int(selection) - 1
+                    if not (0 <= index < len(records)):
+                        print("Selection out of range.")
+                        continue
+                    server_id = records[index].server_id
+                    await self.server_manager.remove_server(server_id)
+                    await self.refresh_tools()
+                    print("Server removed.")
+                except ValueError:
+                    print("Invalid selection.")
+                except Exception as exc:
+                    print(f"Failed to remove server: {exc}")
+            elif choice == "3" or choice == "refresh":
+                await self.refresh_tools()
+                print("Tool list refreshed.")
+            else:
+                print("Unknown option.")
+
+    @staticmethod
+    def _extract_tool_call(raw_response: str) -> dict[str, Any] | None:
+        import json as _json
+        import re as _re
+
+        fenced_pattern = _re.compile(r"```(?:json)?\s*(.*?)\s*```", flags=_re.DOTALL | _re.IGNORECASE)
+        candidates = []
+        for match in fenced_pattern.finditer(raw_response):
+            candidates.append(match.group(1))
+
+        if not candidates:
+            candidates = [raw_response]
+
+        for candidate in candidates:
+            cleaned = candidate.strip()
+            try:
+                parsed = _json.loads(cleaned)
+            except _json.JSONDecodeError:
+                continue
+            if "tool" in parsed and "arguments" in parsed:
+                return parsed
+        return None
+
+    @staticmethod
+    def _format_tool_result(server: HostedServer, tool_name: str, result: types.CallToolResult) -> str:
+        lines = []
+        if getattr(result, "isError", False):
+            lines.append("Tool reported an error:")
+        for item in result.content:
+            lines.append(f"[debug] raw content: {item}")
+            item_type = getattr(item, "type", None)
+            if item_type == "text" and hasattr(item, "text"):
+                lines.append(item.text)
+            elif isinstance(item, dict):
+                if item.get("type") == "text" and "text" in item:
+                    lines.append(item["text"])
+                else:
+                    lines.append(json.dumps(item, indent=2))
+            else:
+                lines.append(str(item))
+        if result.structuredContent:
+            lines.append(json.dumps(result.structuredContent, indent=2))
+        output = "\n".join(line for line in lines if line).strip()
+        if not output:
+            output = "<no content>"
+        return f"Tool `{tool_name}` from `{server.display_name}` returned:\n{output}"
+
+    async def process_llm_response(self, llm_response: str) -> str:
+        tool_call = self._extract_tool_call(llm_response)
+        if not tool_call:
+            return llm_response
+
+        tool_name = tool_call["tool"]
+        arguments = tool_call.get("arguments", {})
+        server = self.tool_to_server.get(tool_name)
+        if not server:
+            return f"No configured MCP server exposes tool '{tool_name}'."
+
         try:
-            await server_info.session.shutdown()
-        except Exception as e:
-            print(f"Error shutting down server {server_name}: {e}")
-    g_mcp_servers.clear()
+            result = await server.execute_tool(tool_name, arguments)
+        except Exception as exc:
+            logging.error("Error executing tool %s: %s", tool_name, exc)
+            return f"Tool execution failed: {exc}"
 
-app = FastAPI(title="MCP Chat Backend", lifespan=lifespan)
+        return self._format_tool_result(server, tool_name, result)
 
-@app.post("/mcp_servers", status_code=201)
-async def add_mcp_server(config: MCPServerConfig):
-    try:
-        message = await connect_to_mcp_server(config)
-        if "already connected" in message:
-             raise HTTPException(status_code=409, detail=message)
-        save_mcp_servers_to_disk()
-        return {"status": "success", "message": message}
-    except ConnectionError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
-@app.delete("/mcp_servers/{server_name}")
-async def remove_mcp_server(server_name: str):
-    if server_name not in g_mcp_servers:
-        raise HTTPException(status_code=404, detail="Server not found.")
-    server_info = g_mcp_servers.pop(server_name)
-    try:
-        await server_info.session.shutdown()
-    except Exception as e:
-        print(f"Error during shutdown of {server_name}: {e}")
-    save_mcp_servers_to_disk()
-    return {"status": "success", "message": f"Disconnected from server '{server_name}'."}
-
-@app.get("/mcp_servers", response_model=List[MCPServerDetails])
-async def list_mcp_servers():
-    return [MCPServerDetails(name=info.name, url=info.url) for info in g_mcp_servers.values()]
-
-@app.get("/oauth/callback", response_class=HTMLResponse)
-async def oauth_callback(code: str, state: str):
-    if state in g_oauth_flows:
-        future = g_oauth_flows.pop(state)
-        future.set_result((code, state))
-        return """<html><head><title>Authentication Successful</title></head><body style="font-family: sans-serif; text-align: center; padding: 40px;"><h1>✅ Authentication Successful</h1><p>You can now close this tab and return to your application.</p></body></html>"""
-    else:
-        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state.")
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat(chat_request: ChatRequest):
-    all_tools, tool_to_server_map = [], {}
-    for name, server_info in g_mcp_servers.items():
+    async def start(self) -> None:
         try:
-            tool_list = await server_info.session.list_tools()
-            for tool in tool_list.tools:
-                prefixed_name = f"{name}__{tool.name}"
-                formatted_tool = {"type": "function", "function": {"name": prefixed_name, "description": tool.description, "parameters": tool.inputSchema}}
-                all_tools.append(formatted_tool)
-                tool_to_server_map[prefixed_name] = server_info
-        except Exception as e:
-            print(f"Could not fetch tools from server '{name}': {e}")
+            await self.server_manager.initialize_all()
+            await self.refresh_tools()
 
-    llm_response = await get_llm_response(chat_request, all_tools)
-    response_message = llm_response.get("choices", [{}])[0].get("message", {})
+            while True:
+                try:
+                    user_input = input("You: ").strip()
+                except EOFError:
+                    logging.info("Input stream closed. Exiting chat.")
+                    break
+                except KeyboardInterrupt:
+                    print("\nExiting...")
+                    break
 
-    if not response_message.get("tool_calls"):
-        return ChatResponse(type="message", message=ChatMessage(role="assistant", content=response_message.get("content", "")))
+                if not user_input:
+                    continue
 
-    chat_request.messages.append(ChatMessage(**response_message))
+                if user_input.lower() in {"quit", "exit"}:
+                    logging.info("Exiting...")
+                    break
 
-    for tool_call in response_message["tool_calls"]:
-        tool_name, tool_args, tool_call_id = tool_call["function"]["name"], json.loads(tool_call["function"]["arguments"]), tool_call["id"]
-        if tool_name not in tool_to_server_map:
-             chat_request.messages.append(ChatMessage(role="tool", tool_call_id=tool_call_id, content=f"Error: Tool '{tool_name}' not found."))
-             continue
+                if user_input.lower() == "/mcp":
+                    await self.open_mcp_menu()
+                    continue
 
-        server_info = tool_to_server_map[tool_name]
-        original_tool_name = tool_name.split("__", 1)[1]
+                self.messages.append({"role": "user", "content": user_input})
+                llm_response = self.llm_client.get_response(self.messages)
+                print(f"\nAssistant: {llm_response}")
 
-        try:
-            result = await server_info.session.call_tool(original_tool_name, arguments=tool_args)
-            content = json.dumps(result.structuredContent) if result.structuredContent else (result.content[0].text if result.content and hasattr(result.content[0], 'text') else "Tool executed.")
-            chat_request.messages.append(ChatMessage(role="tool", tool_call_id=tool_call_id, content=content))
-        except AuthorizationRequiredError as e:
-            return ChatResponse(type="oauth_redirect", redirect_url=str(e.auth_url))
-        except Exception as e:
-            print(f"Error calling tool {tool_name}: {e}")
-            chat_request.messages.append(ChatMessage(role="tool", tool_call_id=tool_call_id, content=f"Error executing tool: {e}"))
+                tool_feedback = await self.process_llm_response(llm_response)
+                if tool_feedback != llm_response:
+                    print(f"\n[Tool] {tool_feedback}\n")
+                    self.messages.append({"role": "assistant", "content": llm_response})
+                    self.messages.append({"role": "system", "content": tool_feedback})
+                    follow_up = self.llm_client.get_response(self.messages)
+                    print(f"\nAssistant: {follow_up}")
+                    self.messages.append({"role": "assistant", "content": follow_up})
+                else:
+                    self.messages.append({"role": "assistant", "content": llm_response})
+        finally:
+            await self.server_manager.shutdown()
 
-    final_llm_response = await get_llm_response(chat_request, all_tools)
-    final_message = final_llm_response.get("choices", [{}])[0].get("message", {})
-    return ChatResponse(type="message", message=ChatMessage(role="assistant", content=final_message.get("content", "")))
 
-async def get_llm_response(chat_request: ChatRequest, tools: List[Dict]) -> Dict:
-    headers = {"Authorization": f"Bearer {chat_request.openrouter_api_key}", "Content-Type": "application/json"}
-    payload = {"model": chat_request.model, "messages": [msg.model_dump(exclude_none=True) for msg in chat_request.messages]}
-    if tools:
-        payload["tools"] = tools
+async def main() -> None:
+    config = Configuration()
+    store = PersistentServerStore(CONFIG_PATH)
+    manager = ServerManager(store, TOKENS_DIR)
+    llm_client = LLMClient(config.llm_api_key)
+    chat_session = ChatSession(manager, llm_client)
+    await chat_session.start()
 
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"Error from OpenRouter: {e.response.text}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
+if __name__ == "__main__":
+    asyncio.run(main())
 
