@@ -37,6 +37,7 @@ class Configuration:
     def __init__(self) -> None:
         self.load_env()
         self.api_key = os.getenv("LLM_API_KEY")
+        self.model = os.getenv("LLM_MODEL", "anthropic/claude-3.5-sonnet")
 
     @staticmethod
     def load_env() -> None:
@@ -48,6 +49,10 @@ class Configuration:
             return "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"
             # raise ValueError("LLM_API_KEY not found in environment variables")
         return self.api_key
+
+    @property
+    def llm_model(self) -> str:
+        return self.model
 
 
 @dataclass
@@ -332,6 +337,24 @@ class Tool:
             f"Arguments:\n{args_text}\n"
         )
 
+    def to_openrouter_spec(self) -> dict[str, Any]:
+        schema: dict[str, Any] = {}
+        if isinstance(self.input_schema, dict):
+            schema = dict(self.input_schema)
+        if not schema:
+            schema = {"type": "object", "properties": {}}
+        schema.setdefault("type", "object")
+        if schema.get("type") != "object":
+            schema = {"type": "object", "properties": {"_": schema}, "required": []}
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description[:1024] if self.description else "",
+                "parameters": schema,
+            },
+        }
+
 
 class HostedServer:
     """Manages a hosted MCP server connection over streamable HTTP with optional OAuth."""
@@ -581,38 +604,40 @@ class ServerManager:
 
 
 class LLMClient:
-    def __init__(self, api_key: str) -> None:
+    """Thin wrapper around the OpenRouter chat completions API with tool calling."""
+
+    def __init__(self, api_key: str, model: str) -> None:
         self.api_key = api_key
+        self.model = model
+        self._client = httpx.AsyncClient(
+            base_url="https://openrouter.ai/api/v1",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/yourusername/mcp-chatbot",
+                "X-Title": "MCP Chatbot",
+            },
+            timeout=60.0,
+        )
 
-    def get_response(self, messages: list[dict[str, str]]) -> str:
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": "https://github.com/yourusername/mcp-chatbot",
-            "X-Title": "MCP Chatbot",
-        }
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], str | None]:
         payload = {
+            "model": self.model,
             "messages": messages,
-            "model": "anthropic/claude-4.5-sonnet",
-            "temperature": 0.7,
-            "max_tokens": 4096,
-            "top_p": 1,
-            "stream": False,
+            "tools": tools,
         }
+        response = await self._client.post("/chat/completions", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        choice = data["choices"][0]
+        return choice["message"], choice.get("finish_reason")
 
-        try:
-            with httpx.Client() as client:
-                response = client.post(url, headers=headers, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                return data["choices"][0]["message"]["content"]
-        except httpx.RequestError as exc:
-            logging.error("Error getting LLM response: %s", exc)
-            if isinstance(exc, httpx.HTTPStatusError):
-                logging.error("Status code: %s", exc.response.status_code)
-                logging.error("Response details: %s", exc.response.text)
-            return "I encountered an error reaching the LLM. Please try again later."
+    async def close(self) -> None:
+        await self._client.aclose()
 
 
 class ChatSession:
@@ -621,46 +646,42 @@ class ChatSession:
         self.llm_client = llm_client
         self.tool_cache: dict[str, list[Tool]] = {}
         self.tool_to_server: dict[str, HostedServer] = {}
-        self.messages: list[dict[str, str]] = []
+        self.tool_specs: list[dict[str, Any]] = []
+        self.messages: list[dict[str, Any]] = []
         self.system_message: str = ""
 
     async def refresh_tools(self) -> None:
         self.tool_cache = await self.server_manager.refresh_tool_cache()
         self.tool_to_server.clear()
-        tools: list[Tool] = []
+        all_tools: list[Tool] = []
         for server_id, server_tools in self.tool_cache.items():
             server = self.server_manager.active_servers.get(server_id)
             if not server:
                 continue
             for tool in server_tools:
-                logging.info("Tool schema loaded: %s -> %s", tool.name, json.dumps(tool.input_schema, indent=2))
                 if tool.name not in self.tool_to_server:
                     self.tool_to_server[tool.name] = server
-            tools.extend(server_tools)
-        self.system_message = self._build_system_prompt(tools)
-        if self.messages and self.messages[0]["role"] == "system":
-            self.messages[0]["content"] = self.system_message
+            all_tools.extend(server_tools)
+
+        self.tool_specs = [tool.to_openrouter_spec() for tool in all_tools]
+        self.system_message = self._build_system_prompt(all_tools)
+        system_entry = {"role": "system", "content": self.system_message}
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0] = system_entry
         else:
-            self.messages.insert(0, {"role": "system", "content": self.system_message})
+            self.messages.insert(0, system_entry)
 
     @staticmethod
     def _build_system_prompt(tools: list[Tool]) -> str:
         if tools:
-            tools_description = "\n".join(tool.format_for_llm() for tool in tools)
+            catalog = "\n".join(tool.format_for_llm() for tool in tools)
         else:
-            tools_description = "No MCP tools are currently configured. Respond directly without using tools."
-
+            catalog = "No MCP tools are currently configured. Respond directly without using tools."
         return (
-            "You are a helpful assistant with access to these tools:\n\n"
-            f"{tools_description}\n\n"
-            "When you need to call a tool, DO NOT COMMENT. ONLY respond with exactly this JSON structure, and NOTHING else:\n"
-            "{\n"
-            '    "tool": "tool-name",\n'
-            '    "arguments": {\n'
-            '        "argument-name": "value"\n'
-            "    }\n"
-            "}\n\n"
-            "After the tool responds, summarise the results conversationally. If no tool is required, reply directly."
+            "You are a helpful assistant. Use the available MCP tools when they will help the user. "
+            "Always wait for tool results before giving a final answer.\n\n"
+            "Available tools:\n"
+            f"{catalog}"
         )
 
     async def open_mcp_menu(self) -> None:
@@ -728,35 +749,11 @@ class ChatSession:
                 print("Unknown option.")
 
     @staticmethod
-    def _extract_tool_call(raw_response: str) -> dict[str, Any] | None:
-        import json as _json
-        import re as _re
-
-        fenced_pattern = _re.compile(r"```(?:json)?\s*(.*?)\s*```", flags=_re.DOTALL | _re.IGNORECASE)
-        candidates = []
-        for match in fenced_pattern.finditer(raw_response):
-            candidates.append(match.group(1))
-
-        if not candidates:
-            candidates = [raw_response]
-
-        for candidate in candidates:
-            cleaned = candidate.strip()
-            try:
-                parsed = _json.loads(cleaned)
-            except _json.JSONDecodeError:
-                continue
-            if "tool" in parsed and "arguments" in parsed:
-                return parsed
-        return None
-
-    @staticmethod
     def _format_tool_result(server: HostedServer, tool_name: str, result: types.CallToolResult) -> str:
         lines = []
         if getattr(result, "isError", False):
             lines.append("Tool reported an error:")
         for item in result.content:
-            lines.append(f"[debug] raw content: {item}")
             item_type = getattr(item, "type", None)
             if item_type == "text" and hasattr(item, "text"):
                 lines.append(item.text)
@@ -774,24 +771,89 @@ class ChatSession:
             output = "<no content>"
         return f"Tool `{tool_name}` from `{server.display_name}` returned:\n{output}"
 
-    async def process_llm_response(self, llm_response: str) -> str:
-        tool_call = self._extract_tool_call(llm_response)
-        if not tool_call:
-            return llm_response
+    @staticmethod
+    def _message_content_to_text(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            chunks: list[str] = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    chunks.append(part.get("text", ""))
+                else:
+                    chunks.append(json.dumps(part))
+            return "\n".join(chunk for chunk in chunks if chunk)
+        return str(content)
 
-        tool_name = tool_call["tool"]
-        arguments = tool_call.get("arguments", {})
-        server = self.tool_to_server.get(tool_name)
-        if not server:
-            return f"No configured MCP server exposes tool '{tool_name}'."
+    async def _process_tool_calls(self, tool_calls: list[dict[str, Any]]) -> None:
+        for call in tool_calls:
+            function_data = call.get("function", {}) or {}
+            tool_name = function_data.get("name", "")
+            arguments_payload = function_data.get("arguments", "{}")
+            try:
+                arguments = json.loads(arguments_payload or "{}")
+            except json.JSONDecodeError:
+                logging.warning("Failed to parse arguments for tool %s: %s", tool_name, arguments_payload)
+                arguments = {}
 
-        try:
-            result = await server.execute_tool(tool_name, arguments)
-        except Exception as exc:
-            logging.error("Error executing tool %s: %s", tool_name, exc)
-            return f"Tool execution failed: {exc}"
+            server = self.tool_to_server.get(tool_name)
+            if not server:
+                error_text = f"Tool '{tool_name}' is not available."
+                payload = {"error": error_text}
+                print(f"\n[Tool] {error_text}\n")
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id"),
+                        "name": tool_name,
+                        "content": json.dumps(payload),
+                    }
+                )
+                continue
 
-        return self._format_tool_result(server, tool_name, result)
+            try:
+                result = await server.execute_tool(tool_name, arguments)
+                payload = result.model_dump()
+                display_text = self._format_tool_result(server, tool_name, result)
+            except Exception as exc:
+                logging.error("Error executing tool %s: %s", tool_name, exc)
+                payload = {"error": str(exc)}
+                display_text = f"Tool `{tool_name}` failed: {exc}"
+
+            print(f"\n[Tool] {display_text}\n")
+            self.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "name": tool_name,
+                    "content": json.dumps(payload),
+                }
+            )
+
+    async def _handle_user_message(self, user_input: str) -> None:
+        self.messages.append({"role": "user", "content": user_input})
+
+        while True:
+            try:
+                message, finish_reason = await self.llm_client.complete(self.messages, self.tool_specs)
+            except httpx.HTTPError as exc:
+                logging.error("Failed to contact OpenRouter: %s", exc)
+                print("\nAssistant: I couldn't reach the language model service. Please try again in a moment.")
+                break
+            self.messages.append(message)
+
+            tool_calls = message.get("tool_calls") or []
+            if tool_calls:
+                await self._process_tool_calls(tool_calls)
+                continue
+
+            assistant_text = self._message_content_to_text(message.get("content"))
+            if assistant_text:
+                print(f"\nAssistant: {assistant_text}")
+            if finish_reason != "tool_calls":
+                break
 
     async def start(self) -> None:
         try:
@@ -819,21 +881,9 @@ class ChatSession:
                     await self.open_mcp_menu()
                     continue
 
-                self.messages.append({"role": "user", "content": user_input})
-                llm_response = self.llm_client.get_response(self.messages)
-                print(f"\nAssistant: {llm_response}")
-
-                tool_feedback = await self.process_llm_response(llm_response)
-                if tool_feedback != llm_response:
-                    print(f"\n[Tool] {tool_feedback}\n")
-                    self.messages.append({"role": "assistant", "content": llm_response})
-                    self.messages.append({"role": "system", "content": tool_feedback})
-                    follow_up = self.llm_client.get_response(self.messages)
-                    print(f"\nAssistant: {follow_up}")
-                    self.messages.append({"role": "assistant", "content": follow_up})
-                else:
-                    self.messages.append({"role": "assistant", "content": llm_response})
+                await self._handle_user_message(user_input)
         finally:
+            await self.llm_client.close()
             await self.server_manager.shutdown()
 
 
@@ -841,7 +891,7 @@ async def main() -> None:
     config = Configuration()
     store = PersistentServerStore(CONFIG_PATH)
     manager = ServerManager(store, TOKENS_DIR)
-    llm_client = LLMClient(config.llm_api_key)
+    llm_client = LLMClient(config.llm_api_key, config.llm_model)
     chat_session = ChatSession(manager, llm_client)
     await chat_session.start()
 
