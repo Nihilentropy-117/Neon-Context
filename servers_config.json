@@ -1,0 +1,10 @@
+{
+  "servers": [
+    {
+      "server_id": "mcp-notion-com_mcp",
+      "url": "https://mcp.notion.com/mcp",
+      "transport": "streamable-http",
+      "name": "Notion MCP"
+    }
+  ]
+}
