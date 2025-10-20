@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import os
 import re
 import threading
 import time
@@ -15,44 +14,97 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-from dotenv import load_dotenv
 from mcp import types
 from mcp.client.auth import OAuthClientProvider, TokenStorage
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
 
+try:  # Python 3.11+
+    import tomllib  # type: ignore[attr-defined]
+except ModuleNotFoundError:  # pragma: no cover - only executed on <3.11
+    import tomli as tomllib  # type: ignore[no-redef]
+
+import tomli_w
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-CONFIG_PATH = Path(__file__).resolve().parent / "servers_config.json"
-TOKENS_DIR = Path(__file__).resolve().parent / "tokens"
-CALLBACK_HOST = "127.0.0.1"
-CALLBACK_PORT = 3030
-
 
 class Configuration:
-    """Manages environment variables for the MCP client."""
+    """Loads and validates application settings from a TOML file."""
 
-    def __init__(self) -> None:
-        self.load_env()
-        self.api_key = os.getenv("LLM_API_KEY")
-        self.model = os.getenv("LLM_MODEL", "anthropic/claude-3.5-sonnet")
+    DEFAULT_FILE = Path(__file__).resolve().parent / "config.toml"
+    API_KEY_PLACEHOLDER = "replace-with-your-openrouter-key"
 
-    @staticmethod
-    def load_env() -> None:
-        load_dotenv()
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path) if path else self.DEFAULT_FILE
+        self._data = self._load()
+        self._llm = self._ensure_table("llm")
+        self._oauth = self._ensure_table("oauth")
+        self._storage = self._ensure_table("storage")
+
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            raise FileNotFoundError(f"Configuration file not found: {self.path}")
+        with self.path.open("rb") as handle:
+            data = tomllib.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("Configuration root must be a table")
+        return data
+
+    def _ensure_table(self, key: str) -> dict[str, Any]:
+        value = self._data.get(key, {})
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"Configuration section '{key}' must be a table")
+        return value
+
+    def _resolve_path(self, raw: str, *, default_name: str, is_dir: bool = False) -> Path:
+        base = self.path.parent
+        target = raw.strip() if raw else ""
+        candidate = Path(target) if target else Path(default_name)
+        if not candidate.is_absolute():
+            candidate = (base / candidate).resolve()
+        if is_dir:
+            return candidate
+        return candidate
 
     @property
     def llm_api_key(self) -> str:
-        if not self.api_key:
-            return "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"
-            # raise ValueError("LLM_API_KEY not found in environment variables")
-        return self.api_key
+        api_key = str(self._llm.get("api_key", "")).strip()
+        if not api_key or api_key == self.API_KEY_PLACEHOLDER:
+            raise ValueError(f"Set 'llm.api_key' in {self.path} before running the client")
+        return api_key
 
     @property
     def llm_model(self) -> str:
-        return self.model
+        model = self._llm.get("model", "anthropic/claude-3.5-sonnet")
+        return str(model)
+
+    @property
+    def callback_host(self) -> str:
+        host = self._oauth.get("callback_host", "127.0.0.1")
+        return str(host)
+
+    @property
+    def callback_port(self) -> int:
+        port = self._oauth.get("callback_port", 3030)
+        try:
+            return int(port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("'oauth.callback_port' must be an integer") from exc
+
+    @property
+    def tokens_dir(self) -> Path:
+        raw = str(self._storage.get("tokens_dir", "tokens"))
+        return self._resolve_path(raw, default_name="tokens", is_dir=True)
+
+    @property
+    def servers_file(self) -> Path:
+        raw = str(self._storage.get("servers_file", "servers_config.toml"))
+        return self._resolve_path(raw, default_name="servers_config.toml")
 
 
 @dataclass
@@ -97,24 +149,51 @@ class PersistentServerStore:
         self._data = self._load()
 
     def _load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {"servers": []}
+        if self.path.exists():
+            return self._load_from_path(self.path)
+
+        legacy_path = self.path.with_suffix(".json") if self.path.suffix.lower() != ".json" else None
+        if legacy_path and legacy_path.exists():
+            data = self._load_from_path(legacy_path)
+            self._data = data
+            try:
+                self.save()
+                logging.info("Migrated server configuration from %s to %s", legacy_path, self.path)
+            except Exception as exc:
+                logging.warning("Failed to migrate server configuration to %s: %s", self.path, exc)
+            return data
+
+        return {"servers": []}
+
+    def _load_from_path(self, path: Path) -> dict[str, Any]:
+        suffix = path.suffix.lower()
         try:
-            with self.path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except json.JSONDecodeError as exc:
-            logging.warning("Failed to parse %s: %s", self.path, exc)
+            if suffix == ".toml":
+                with path.open("rb") as handle:
+                    data = tomllib.load(handle)
+            else:
+                with path.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+        except (json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:  # type: ignore[attr-defined]
+            logging.warning("Failed to parse %s: %s", path, exc)
+            return {"servers": []}
+        except FileNotFoundError:
             return {"servers": []}
 
-        servers = data.get("servers")
+        servers = data.get("servers") if isinstance(data, dict) else None
         if isinstance(servers, list):
             return {"servers": servers}
         return {"servers": []}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as handle:
-            json.dump(self._data, handle, indent=2)
+        suffix = self.path.suffix.lower()
+        if suffix == ".toml":
+            with self.path.open("wb") as handle:
+                tomli_w.dump(self._data, handle)
+        else:
+            with self.path.open("w", encoding="utf-8") as handle:
+                json.dump(self._data, handle, indent=2)
 
     def list_records(self) -> list[ServerRecord]:
         return [ServerRecord(**entry) for entry in self._data["servers"]]
@@ -262,7 +341,7 @@ class CallbackHandler(BaseHTTPRequestHandler):
 class CallbackServer:
     """Runs a temporary HTTP server to receive OAuth callbacks."""
 
-    def __init__(self, host: str = CALLBACK_HOST, port: int = CALLBACK_PORT) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 3030) -> None:
         self.host = host
         self.port = port
         self.server: HTTPServer | None = None
@@ -359,9 +438,18 @@ class Tool:
 class HostedServer:
     """Manages a hosted MCP server connection over streamable HTTP with optional OAuth."""
 
-    def __init__(self, record: ServerRecord, token_storage: FileTokenStorage) -> None:
+    def __init__(
+        self,
+        record: ServerRecord,
+        token_storage: FileTokenStorage,
+        *,
+        callback_host: str,
+        callback_port: int,
+    ) -> None:
         self.record = record
         self.token_storage = token_storage
+        self.callback_host = callback_host
+        self.callback_port = callback_port
         self.exit_stack = AsyncExitStack()
         self.session: ClientSession | None = None
         self.initialize_result: types.InitializeResult | None = None
@@ -437,7 +525,7 @@ class HostedServer:
             raise
 
     async def _connect_with_oauth(self) -> None:
-        callback_server = CallbackServer(host=CALLBACK_HOST, port=CALLBACK_PORT)
+        callback_server = CallbackServer(host=self.callback_host, port=self.callback_port)
         callback_server.start()
 
         async def callback_handler() -> tuple[str, str | None]:
@@ -455,7 +543,7 @@ class HostedServer:
         metadata = OAuthClientMetadata.model_validate(
             {
                 "client_name": "Simple Chatbot",
-                "redirect_uris": [f"http://{CALLBACK_HOST}:{CALLBACK_PORT}/callback"],
+                "redirect_uris": [f"http://{self.callback_host}:{self.callback_port}/callback"],
                 "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"],
                 "token_endpoint_auth_method": "client_secret_post",
@@ -518,10 +606,12 @@ class HostedServer:
 class ServerManager:
     """Coordinates hosted MCP servers, tokens, and persistence."""
 
-    def __init__(self, store: PersistentServerStore, tokens_dir: Path) -> None:
+    def __init__(self, store: PersistentServerStore, tokens_dir: Path, *, callback_host: str, callback_port: int) -> None:
         self.store = store
         self.tokens_dir = tokens_dir
         self.tokens_dir.mkdir(parents=True, exist_ok=True)
+        self.callback_host = callback_host
+        self.callback_port = callback_port
         self.active_servers: dict[str, HostedServer] = {}
 
     def _token_path(self, server_id: str) -> Path:
@@ -555,7 +645,12 @@ class ServerManager:
 
     async def _connect_record(self, record: ServerRecord) -> HostedServer:
         storage = FileTokenStorage(self._token_path(record.server_id))
-        server = HostedServer(record, storage)
+        server = HostedServer(
+            record,
+            storage,
+            callback_host=self.callback_host,
+            callback_port=self.callback_port,
+        )
         await server.initialize()
         record.name = server.display_name
         self.store.upsert(record)
@@ -889,8 +984,13 @@ class ChatSession:
 
 async def main() -> None:
     config = Configuration()
-    store = PersistentServerStore(CONFIG_PATH)
-    manager = ServerManager(store, TOKENS_DIR)
+    store = PersistentServerStore(config.servers_file)
+    manager = ServerManager(
+        store,
+        config.tokens_dir,
+        callback_host=config.callback_host,
+        callback_port=config.callback_port,
+    )
     llm_client = LLMClient(config.llm_api_key, config.llm_model)
     chat_session = ChatSession(manager, llm_client)
     await chat_session.start()
@@ -898,4 +998,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

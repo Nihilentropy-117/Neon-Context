@@ -32,16 +32,28 @@ uv pip install mcp
 
 ## Configuration
 
-The client can be configured using environment variables:
+All runtime settings are stored in `config.toml`. Set up the file before starting the client:
 
-- `MCP_SERVER_PORT`: The port where your MCP server is running (default: `8000`)
-- `MCP_TRANSPORT_TYPE`: Transport type to use - either `streamable-http` or `sse` (default: `streamable-http`)
+```toml
+[llm]
+api_key = "replace-with-your-openrouter-key"
+model = "anthropic/claude-3.5-sonnet"
 
-Example:
-```bash
-export MCP_SERVER_PORT=8000
-export MCP_TRANSPORT_TYPE=streamable-http
+[oauth]
+callback_host = "127.0.0.1"
+callback_port = 3030
+
+[storage]
+tokens_dir = "tokens"
+servers_file = "servers_config.toml"
 ```
+
+- `llm.api_key` must contain your OpenRouter-compatible API key.
+- `llm.model` selects the model used for chat completions.
+- `oauth.callback_*` controls the temporary HTTP server used during OAuth flows.
+- `storage.tokens_dir` and `storage.servers_file` determine where OAuth tokens and server definitions are persisted. Paths can be absolute or relative to the TOML file.
+
+On first run the client will transparently migrate the legacy `servers_config.json` file (if present) to the TOML location configured under `storage.servers_file`.
 
 ## Usage
 

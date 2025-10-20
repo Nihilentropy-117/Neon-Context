@@ -1,0 +1,11 @@
+[llm]
+api_key = "replace-with-your-openrouter-key"
+model = "anthropic/claude-3.5-sonnet"
+
+[oauth]
+callback_host = "127.0.0.1"
+callback_port = 3030
+
+[storage]
+tokens_dir = "tokens"
+servers_file = "servers_config.toml"
